@@ -217,7 +217,7 @@ class SerialPort:
             win32.CloseHandle(handle)
 
     async def send(self, data, drain=True):
-        if len(data) == 0:
+        if not data:
             return 0
         if self._on_overlapped_send:
             await self._drain()

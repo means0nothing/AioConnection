@@ -102,7 +102,8 @@ class SerialTransport(asyncio.Transport):
 
     def _open(self):
         if not self._is_task_running(self._open_task) and self._is_closing and self._port:
-            self._open_task = self._loop.create_task(self._opening())
+            # TODO make cancelled task stub in __init__ for all tasks
+            self._send_task =  self._open_task = self._loop.create_task(self._opening())
 
     def is_active(self):
         return self._is_active

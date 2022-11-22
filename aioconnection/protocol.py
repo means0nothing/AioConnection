@@ -1,64 +1,202 @@
-from .utils import ftime
-
 import asyncio
+import itertools
 import time
 import datetime
 import typing as t
-from enum import IntEnum
-from collections import deque
+from abc import ABC, abstractmethod
+from enum import IntEnum, auto
+from collections import deque, ChainMap
+from dataclasses import dataclass, field
+import functools
+
+from notool import Publisher, publisher, enum_str
+
+from aioconnection.utils import ftime
 
 
-class EventType(IntEnum):
-    RECV = 0
-    SEND = 1
-    REPLY = 2
-    CONNECTED = 3
-    CONNECT_FAILED = 4
-    IDLE = 5
+@enum_str
+class Ttype(IntEnum):
+    UNKNOWN = 1
+    TCP = auto()
+    SERIAL = auto()
+
+    @classmethod
+    def _member2str_map(cls):
+        return {cls.UNKNOWN: 'Unknown', cls.TCP: 'TCP', cls.SERIAL: 'Serial'}
 
 
-# TODO добавить в инициализацию класса протокола
-class Bytes(bytes):
+# TODO add alias
+@dataclass
+class TransportInfo:
+    type: Ttype
+    source: tuple[str, int] = None
+    dest: t.Union[tuple[str, int], str] = None
+    exception: t.Any = None
+
+    @classmethod
+    def make(cls, transport, exc=None):
+        dest = None
+        type_ = Ttype.UNKNOWN
+        if source := transport.get_extra_info('serialname'):
+            type_ = Ttype.SERIAL
+        elif source := transport.get_extra_info('sockname'):
+            type_ = Ttype.TCP
+            dest = transport.get_extra_info('peername')
+        else:
+            source = None
+        return cls(type_, source, dest, exc)
+
     def __str__(self):
-        return self.hex(bytes_per_sep=1, sep=' ')
+        source = f'{self.source}' if self.source else ''
+        dest = ''
+        exc = f', {self.exception}' if self.exception else ''
+        if self.type is Ttype.TCP:
+            source = f'source {self.source[0]}:{self.source[1]}' if self.source else ''
+            dest = f', dest {self.dest[0]}:{self.dest[1]}' if self.dest else ''
+        return f'{self.type} ({source}{dest}){exc}'
 
 
-class Event(t.NamedTuple):
-    timestamp: t.Union[float, datetime.datetime, time.time]
-    type: EventType
-    data_raw: t.Optional[bytes]
-    data: t.Optional[object]
+# TODO event with partial not parsed data
+@enum_str
+class Etype(IntEnum):
+    CONNECTED = 1
+    CONNECT_FAILED = auto()
+    SEND = auto()
+    RECV = auto()
+    REPLY_EXPIRED = auto()
+    IDLE = auto()
+
+    @classmethod
+    def _member2str_map(cls):
+        return {cls.CONNECTED: 'Connected', cls.CONNECT_FAILED: 'Connect Failed',
+                cls.SEND: 'Send', cls.RECV: 'Receive', cls.REPLY_EXPIRED: 'Reply Timeout',
+                cls.IDLE: 'Idle'}
 
 
-# TODO Multiple transport on Protocol
-class Protocol(asyncio.Protocol):
+# TODO metadata like auth user
+@dataclass
+class Event:
+    time: t.Union[float, datetime.datetime]
+    type: Etype
+    bytes: bytes
+    data: t.Union[TransportInfo, t.Any] = None
+
+    @property
+    def write_id(self):
+        return getattr(self, '_id', 0)
+
+    @write_id.setter
+    def write_id(self, value):
+        setattr(self, '_id', value)
+
+    def reply_accepted(self):
+        if _reply_accepted := getattr(self, '_reply_accepted', None):
+            _reply_accepted()
+
+
+class _TailSentinel:
+    def __bool__(self):
+        return False
+
+TAIL_SENTINEL = _TailSentinel()
+
+
+class Parser:
+    def process(self, *data: t.Any, event_type: Etype = Etype.RECV) \
+            -> t.Generator[tuple[t.Union[bytes, bytearray], t.Any], None, None]:
+        for data_ in data:
+            yield from self._process(data_, event_type)
+
+    def _process(self, data: t.Any, event_type: Etype) -> tuple[t.Union[bytes, bytearray], t.Any]:
+        yield b'', None
+
+
+class StrParser(Parser):
+    def __init__(self, codec: str = 'charmap'):
+        self.codec = codec
+
+    def _process(self, data: t.Any, event_type: Etype):
+        raw, parsed = b'', None
+        try:
+            if isinstance(data, bytes):
+                raw = data
+                parsed = data.decode(self.codec)
+            elif isinstance(data, str):
+                parsed = data
+                raw = data.encode(self.codec)
+            else:
+                raise TypeError(f'Accepted data type must be in {str, bytes}')
+        except ValueError:
+            ...
+        yield raw, parsed
+
+
+class RawParser(Parser):
+    def _process(self, data: t.Any, event_type: Etype):
+        if isinstance(data, bytes):
+            return data, None
+        else:
+            raise TypeError(f'Accepted data type must be {bytes}')
+
+
+# TODO debug set in logger level
+# TODO parser, timeouts cls or self attrs??
+# TODO _in_buffer to bytearray + limit maximum length by cutting head (do it in Parser)?
+class Protocol(asyncio.Protocol, Publisher):
     DEBUG = False
+    parser_factory = StrParser
+    event_factory = Event
 
     def __init__(self, *,
-                 subscribers: t.Union[t.Callable, t.Iterable[t.Callable]] = None,
+                 event_factory: t.Callable = None,
                  event_ftime: t.Callable = None,
+                 parser=None,
+                 reply_timeout: float = 0.0,
                  idle_timeout: float = 0.0,
                  log_size: int = 0,
-                 loop=None):
-        self.log: t.Optional[deque[Event]] = deque(maxlen=log_size) if log_size else None
-        self.transport: t.Optional[asyncio.Transport] = None
-
-        self._subscribers = set()
+                 loop=None,
+                 subscribers: t.Union[t.Callable, t.Iterable[t.Callable]] = None,
+                 init_callback: t.Callable = None,
+                 **kwargs):
+        Publisher.__init__(self)
         if subscribers:
             self.subscribe(subscribers)
-        self._event_ftime = event_ftime or ftime
+
+        self.event_factory = event_factory or self.event_factory
+        self.event_ftime = event_ftime or datetime.datetime.now
+        self.parser = parser or self.parser_factory()
+        self._log: t.Optional[deque[Event]] = deque(maxlen=log_size) if log_size else None
+        self.transport: t.Optional[asyncio.Transport] = None
+        self.transport_info: t.Optional[TransportInfo] = None
+        self.reply_timeout = reply_timeout
+        # TODO write id to class
+        self._write_id = 0
+        self._next_write_id = 0
         self._loop: asyncio.AbstractEventLoop = loop or asyncio.get_event_loop()
-        self._out_buffer = deque()
+        self._in_buffer: bytes = b''
+        self._out_buffer: deque[tuple[list[bytes, t.Any], float]] = deque()
         self._allowed_to_write = False
         self._reply_awaiting = False
-        self._reply_timeout_handle: t.Optional[asyncio.Handle] = None
-        self._activity_last_time = 0.0
+        # TODO maybe create cancelled task and handle
+        self._reply_handle: t.Optional[asyncio.Handle] = None
+        self._recv_last_time = 0.0
         self._idle_timeout = idle_timeout
         self._ping_task: t.Optional[asyncio.Task] = None
-        self.__post_init__()
+        self.__post_init__(**kwargs)
+        if init_callback:
+            init_callback(self)
 
     def __post_init__(self, **kwargs):
         ...
+
+    # TODO remove property, was made for debugging
+    @property
+    def log(self):
+        return list(self._log)
+
+    @log.setter
+    def log(self, log):
+        self._log = log
 
     @property
     def idle_timeout(self):
@@ -75,9 +213,9 @@ class Protocol(asyncio.Protocol):
     async def _pinging(self):
         while True:
             await asyncio.sleep(self._idle_timeout)
-            time_diff = ftime() - self._activity_last_time
-            if time_diff >= self._idle_timeout and not (self._out_buffer or self._reply_timeout_handle):
-                self._register_event(EventType.IDLE)
+            time_diff = ftime() - self._recv_last_time
+            if time_diff >= self._idle_timeout and not (self._out_buffer or self._reply_handle):
+                self._register_event(Etype.IDLE)
 
     def connection_made(self, transport: asyncio.Transport):
         self.transport = transport
@@ -85,34 +223,44 @@ class Protocol(asyncio.Protocol):
             self._ping_task = self._loop.create_task(self._pinging())
         self._allowed_to_write = True
         self._write()
-        if not (name := transport.get_extra_info('serialname')):
-            name = transport.get_extra_info('peername')
-            transport.set_write_buffer_limits(1, 1)
-        self._register_event(EventType.CONNECTED, data=name)
+        self.transport_info = TransportInfo.make(transport)
+        if self.transport_info.type == Ttype.TCP:
+            transport.set_write_buffer_limits(0, 0)
+        self._register_event(Etype.CONNECTED, data=self.transport_info)
 
     def connection_failed(self, exc=None, transport: asyncio.Transport = None):
         self.transport = transport or self.transport
         self._allowed_to_write = False
         self._ping_task and self._ping_task.cancel()
-        self._register_event(EventType.CONNECT_FAILED, data=exc)
+        self._reply_expired(False)
+        self.transport_info = TransportInfo.make(self.transport, exc)
+        self._register_event(Etype.CONNECT_FAILED, data=self.transport_info)
 
     def connection_lost(self, exc):
         self.connection_failed(exc)
 
-    def parse_received_data(self, data_raw):
-        yield data_raw, None
-
     def data_received(self, data_raw):
-        self._activity_last_time = ftime()
-        time_ = self._event_ftime()
-        info_type = EventType.RECV
-        if self._reply_timeout_handle:         # TODO do not send event if closing, except special reply callback
-            self._reply_timeout_handle.cancel()
-            self._reply_timeout_handle = None
-            info_type = EventType.REPLY
+        self._recv_last_time = ftime()
+        time_ = self.event_ftime()
+        event_type = Etype.RECV
+        data_raw = self._in_buffer + data_raw if self._in_buffer else data_raw
+        bytes_data = list(self.parser.process(data_raw))
+        self._in_buffer = b''
+        is_reply = bool(self._reply_handle)
+        for bytes_, data in bytes_data:
+            if data is TAIL_SENTINEL:
+                self._in_buffer = bytes_
+                continue
+            self._register_event(event_type, bytes_, data, time_,
+                                 set_id=is_reply, set_reply=is_reply)
+
+    def _reply_expired(self, accepted=True):
+        if self._reply_handle:
+            self._reply_handle.cancel()
+            self._reply_handle = None
+            if not accepted:
+                self._register_event(Etype.REPLY_EXPIRED, set_id=True)
             self._write()
-        for data_raw, data in self.parse_received_data(data_raw):
-            self._register_event(info_type, data_raw, data, time_)
 
     def resume_writing(self):
         self.data_drained()
@@ -120,55 +268,52 @@ class Protocol(asyncio.Protocol):
     def pause_writing(self):
         self._allowed_to_write = False
 
-    def data_drained(self):
-        self._allowed_to_write = True
-        data_raw, reply_timeout, data = self._out_buffer.popleft()
-        if reply_timeout:
-            self._reply_timeout_handle = self._loop.call_later(reply_timeout, self.data_received, None)
-        else:
-            self._write()
-        self._register_event(EventType.SEND, data_raw, data)
-
-    def write(self, data_raw, reply_timeout=0.0, data=None):
-        self._out_buffer.append((data_raw, reply_timeout, data))
+    def write(self, *data: t.Union[bytes, str, object], reply_timeout: t.Optional[float] = 0.0):
+        bytes_data = list(self.parser.process(*data, event_type=Etype.SEND))
+        reply_timeout = 0.0 if reply_timeout is None else self.reply_timeout + reply_timeout
+        self._out_buffer.append((bytes_data, reply_timeout))
         self._write()
+        self._next_write_id += 1
+        return self._next_write_id
 
     def _write(self):
-        if self._allowed_to_write and self._out_buffer and not self._reply_timeout_handle:
+        if self._allowed_to_write and self._out_buffer and not self._reply_handle:
+            bytes_data = self._out_buffer[0][0]
             try:
-                self.transport.write(self._out_buffer[0][0])
+                self.transport.write(b''.join(bytes_ for bytes_, data in bytes_data))
             except RuntimeError:
                 pass
 
-    def _register_event(self, type_, data_raw=None, data=None, time_=None):
-        time_ = time_ or self._event_ftime()
-        event = Event(time_, type_, Bytes(data_raw or b''), data)
+    def data_drained(self):
+        time_ = self.event_ftime()
+        self._allowed_to_write = True
+        bytes_data, reply_timeout = self._out_buffer.popleft()
+        if reply_timeout:
+            self._reply_handle = self._loop.call_later(reply_timeout, self._reply_expired, False)
+        else:
+            self._write()
+        self._write_id += 1
+        for bytes_, data in bytes_data:
+            self._register_event(Etype.SEND, bytes_, data, time_, set_id=True)
+
+    def _register_event(self, type_, bytes_=b'', data=None, time_=None, *,
+                        set_id=False, set_reply=False):
+        event = self.event_factory(time_ or self.event_ftime(), type_, bytes_, data)
+        if set_id:
+            event.write_id = self._write_id
+        if set_reply:
+            setattr(event, '_reply_accepted', self._reply_expired)
         if self.DEBUG:
             print(event)
-        if self.log is not None and type_ is not EventType.IDLE:
-            self.log.append(event)
+        if self._log is not None and type_ not in (Etype.IDLE, Etype.REPLY_EXPIRED):
+            self._log.append(event)
 
-        self._loop.call_soon(self.event_handler, event)
-        for subscriber in self._subscribers:
-            self._loop.call_soon(subscriber, event)
+        # self._loop.call_soon(self.event_handler, event)
+        self.event_handler(event)
+        self.publish(event, loop=self._loop)
 
-    def event_handler(self, event: Event = None):
+    def event_handler(self, event: Event):
         ...
-
-    def subscribe(self, subscribers):
-        if isinstance(subscribers, t.Iterable):
-            self._subscribers.update(subscribers)
-        else:
-            self._subscribers.add(subscribers)
-
-    def unsubscribe(self, subscribers):
-        if isinstance(subscribers, t.Iterable):
-            self._subscribers.difference_update(subscribers)
-        else:
-            try:
-                self._subscribers.remove(subscribers)
-            except KeyError:
-                pass
 
 
 if __name__ == '__main__':

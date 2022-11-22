@@ -1,9 +1,19 @@
-__version__ = '0.1.0'
+__version__ = '0.1.1'
 
-from .protocol import Protocol, EventType, Event
+from .protocol import (
+    Protocol,
+    TAIL_SENTINEL,
+    Parser,
+    StrParser,
+    RawParser,
+    Etype,
+    Event,
+)
+
 
 __all__ = ['Protocol',
-           'EventType',
+           'TAIL_SENTINEL',
+           'Parser',
+           'Etype',
            'Event']
-
 
