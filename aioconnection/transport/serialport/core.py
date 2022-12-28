@@ -1,7 +1,3 @@
-from aioconnection.utils import ftime
-
-from serial import win32
-
 import asyncio
 import platform
 import ctypes
@@ -10,6 +6,10 @@ import copy
 import re
 from enum import Enum
 from dataclasses import dataclass, field
+
+from serial import win32
+
+from aioconnection.utils import ftime
 
 
 if platform.platform().startswith('Windows-1'):

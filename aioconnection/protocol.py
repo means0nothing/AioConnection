@@ -1,13 +1,9 @@
 import asyncio
-import itertools
-import time
 import datetime
 import typing as t
-from abc import ABC, abstractmethod
 from enum import IntEnum, auto
-from collections import deque, ChainMap
-from dataclasses import dataclass, field
-import functools
+from collections import deque
+from dataclasses import dataclass
 
 from notool import Publisher, publisher, enum_str
 
@@ -35,15 +31,13 @@ class TransportInfo:
 
     @classmethod
     def make(cls, transport, exc=None):
-        dest = None
+        dest = source = None
         type_ = Ttype.UNKNOWN
         if source := transport.get_extra_info('serialname'):
             type_ = Ttype.SERIAL
         elif source := transport.get_extra_info('sockname'):
             type_ = Ttype.TCP
             dest = transport.get_extra_info('peername')
-        else:
-            source = None
         return cls(type_, source, dest, exc)
 
     def __str__(self):
@@ -97,6 +91,7 @@ class Event:
 class _TailSentinel:
     def __bool__(self):
         return False
+
 
 TAIL_SENTINEL = _TailSentinel()
 
@@ -165,7 +160,7 @@ class Protocol(asyncio.Protocol, Publisher):
         self.event_factory = event_factory or self.event_factory
         self.event_ftime = event_ftime or datetime.datetime.now
         self.parser = parser or self.parser_factory()
-        self._log: t.Optional[deque[Event]] = deque(maxlen=log_size) if log_size else None
+        self.log: t.Optional[deque[Event]] = deque(maxlen=log_size) if log_size else None
         self.transport: t.Optional[asyncio.Transport] = None
         self.transport_info: t.Optional[TransportInfo] = None
         self.reply_timeout = reply_timeout
@@ -188,15 +183,6 @@ class Protocol(asyncio.Protocol, Publisher):
 
     def __post_init__(self, **kwargs):
         ...
-
-    # TODO remove property, was made for debugging
-    @property
-    def log(self):
-        return list(self._log)
-
-    @log.setter
-    def log(self, log):
-        self._log = log
 
     @property
     def idle_timeout(self):
@@ -263,7 +249,7 @@ class Protocol(asyncio.Protocol, Publisher):
             self._write()
 
     def resume_writing(self):
-        self.data_drained()
+        self._data_drained()
 
     def pause_writing(self):
         self._allowed_to_write = False
@@ -284,7 +270,7 @@ class Protocol(asyncio.Protocol, Publisher):
             except RuntimeError:
                 pass
 
-    def data_drained(self):
+    def _data_drained(self):
         time_ = self.event_ftime()
         self._allowed_to_write = True
         bytes_data, reply_timeout = self._out_buffer.popleft()
@@ -305,8 +291,8 @@ class Protocol(asyncio.Protocol, Publisher):
             setattr(event, '_reply_accepted', self._reply_expired)
         if self.DEBUG:
             print(event)
-        if self._log is not None and type_ not in (Etype.IDLE, Etype.REPLY_EXPIRED):
-            self._log.append(event)
+        if self.log is not None and type_ not in (Etype.IDLE, Etype.REPLY_EXPIRED):
+            self.log.append(event)
 
         # self._loop.call_soon(self.event_handler, event)
         self.event_handler(event)

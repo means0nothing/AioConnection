@@ -1,9 +1,9 @@
-import asyncio
 import time
 
 
 def ftime():
     return time.monotonic()
+
 
 # TODO
 class WriteId:
