@@ -169,7 +169,7 @@ class Protocol(asyncio.Protocol, Publisher):
         self._next_write_id = 0
         self._loop: asyncio.AbstractEventLoop = loop or asyncio.get_event_loop()
         self._in_buffer: bytes = b''
-        self._out_buffer: deque[tuple[list[bytes, t.Any], float]] = deque()
+        self._out_buffer: deque[tuple[list, float]] = deque()
         self._allowed_to_write = False
         self._reply_awaiting = False
         # TODO maybe create cancelled task and handle
@@ -225,20 +225,23 @@ class Protocol(asyncio.Protocol, Publisher):
     def connection_lost(self, exc):
         self.connection_failed(exc)
 
-    def data_received(self, data_raw):
-        self._recv_last_time = ftime()
-        time_ = self.event_ftime()
-        event_type = Etype.RECV
-        data_raw = self._in_buffer + data_raw if self._in_buffer else data_raw
-        bytes_data = list(self.parser.process(data_raw))
-        self._in_buffer = b''
-        is_reply = bool(self._reply_handle)
-        for bytes_, data in bytes_data:
-            if data is TAIL_SENTINEL:
-                self._in_buffer = bytes_
-                continue
-            self._register_event(event_type, bytes_, data, time_,
-                                 set_id=is_reply, set_reply=is_reply)
+    def data_received(self, data_raw: bytes, force: bool = False):
+        if self._allowed_to_write or force:
+            self._recv_last_time = ftime()
+            time_ = self.event_ftime()
+            event_type = Etype.RECV
+            data_raw = self._in_buffer + data_raw if self._in_buffer else data_raw
+            bytes_data = list(self.parser.process(data_raw))
+            self._in_buffer = b''
+            is_reply = bool(self._reply_handle)
+            for bytes_, data in bytes_data:
+                if data is TAIL_SENTINEL:
+                    self._in_buffer = bytes_
+                    continue
+                self._register_event(event_type, bytes_, data, time_,
+                                     set_id=is_reply, set_reply=is_reply)
+        else:
+            self._loop.call_soon(self.data_received, data_raw, True)
 
     def _reply_expired(self, accepted=True):
         if self._reply_handle:
